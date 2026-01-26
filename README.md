@@ -32,7 +32,7 @@ pip install -r requirements.txt
 ```
 
 ## Data preparation
-Please directly download the newest processed datasets from [BatteryLife project](https://github.com/Ruifeng-Tan/BatteryLife), and move them to a folder whose path will be used as `root_path` in a lot of scripts (e.g., `PBT.sh`) in this project.
+We corrected several data-preprocessing mistakes in the original [BatteryLife project](https://github.com/Ruifeng-Tan/BatteryLife) for the Zn-coin and CALB datasets. Please download the processed Zn-coin and CALB datasets, along with their corresponding labels, from [this link](https://doi.org/10.6084/m9.figshare.31148413). For all other processed datasets, please download [BatteryLife v9](https://zenodo.org/records/17958489) and place the files in a directory whose path will be specified as `root_path` in many scripts in this project (e.g., `PBT.sh`).
 
 ## Pretrained checkpoints
 We have provided the pretrained parameters reported in the paper. Please download them from [Zenodo](https://zenodo.org/records/17972780).

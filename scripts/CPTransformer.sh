@@ -1,5 +1,5 @@
-model_name=CPMLP
-master_port=25290
+model_name=CPTransformer
+master_port=25339
 dataset=ZN-coin2024 # MIX_all, MIX_all42, MIX_all2024
 seed=2024 # 2021, 42, 2024
 train_epochs=100
@@ -25,15 +25,15 @@ n_heads=8
 seq_len=1
 accumulation_steps=1
 
-e_layers=4
-d_layers=6
+e_layers=2
+d_layers=10
 
 bottleneck_factor=16 # scale down factor for the bottleneck layer
 d_model=128
-d_ff=64
+d_ff=128
 
 d_llm=4096 #70B - 8192;  8B-4096; 3B-3072
-dropout=0.25
+dropout=0.05
 charge_discharge_length=300
 patience=5 # Eearly stopping patience
 lradj=constant
@@ -63,7 +63,7 @@ comment='50to1' # Llama2
 
 
 # /data/LLMs/models--meta-llama--Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659
-CUDA_VISIBLE_DEVICES=4,5 accelerate launch --mixed_precision bf16 --num_processes $num_process --main_process_port $master_port run_main.py \
+CUDA_VISIBLE_DEVICES=0,1 accelerate launch --mixed_precision bf16 --num_processes $num_process --main_process_port $master_port run_main.py \
   --num_process $num_process \
   --lradj_factor $lradj_factor \
   --task_name battery_life_prediction \

@@ -522,7 +522,7 @@ for ii in range(args.itr):
             total_seen_unseen_ids = total_seen_unseen_ids + seen_unseen_ids.detach().cpu().numpy().reshape(-1).tolist()
             total_seen_number_of_cycles = total_seen_number_of_cycles + seen_number_of_cycles.detach().cpu().numpy().reshape(-1).tolist()
 
-    res_path='./results/1_100_analysis/'
+    res_path=f'./results/{eval_cycle_min}_{eval_cycle_max}_analysis/'
     save_res = {}
     save_res[dataset] = {}
     # accelerator.wait_for_everyone()
