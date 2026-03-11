@@ -2,7 +2,8 @@ model_name=PBT
 topK=-1
 finetune_dataset=ZN-coin42 # ZN-coin, ZN-coin42, ZN-coin2024, NAion, CALB
 batch_size=128
-args_path=/data/LLMs/checkpoints/PBT_10_Llama_1_le80_bs128_lr2.5e-05_dm128_nh8_el2_dl10_df128_mdf64_lradjconstant_MIX_large_guideFalse_LBFalse_lossMSE_wd0.01_wlFalse_dr0.05_gdff512_E5_GE5_K-1_SFalse_augFalse_augW1.0_tem1.0_wDGFalse_dsr0.75_we0_ffsTrue_seed42-100/
+# Override ARGS_PATH if your checkpoint root differs from the repo layout.
+args_path=${ARGS_PATH:-/data/LLMs/checkpoints/Llama/pbt_mixL_lma_s42_r100/}
 master_port=25250
 train_epochs=300
 
