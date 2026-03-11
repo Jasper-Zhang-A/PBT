@@ -27,7 +27,14 @@ from layers.Adapters import PBTtLayerWithAdapter, PBTCPLayerWithAdapter
 # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
 # os.environ["CUDA_VISIBLE_DEVICES"] = '2,3,4,5'
 import joblib
-from utils.tools import del_files, EarlyStopping, domain_average, vali_batteryLifeLLM
+from utils.tools import (
+    del_files,
+    EarlyStopping,
+    domain_average,
+    vali_batteryLifeLLM,
+    build_agent_model_kwargs,
+    maybe_print_agent_debug,
+)
 parser = argparse.ArgumentParser(description='Time-LLM')
 
 def add_adapters_to_PBT_withCP_no_bottom(args, model, adapter_size=64):
@@ -336,6 +343,16 @@ parser.add_argument('--wo_DKPrompt', action='store_true', default=False, help='S
 # BatteryFormer
 parser.add_argument('--charge_discharge_length', type=int, default=100, help='The resampled length for charge and discharge curves')
 
+# Agent MVP
+parser.add_argument('--use_agent', action='store_true', default=False, help='Set True to load the offline Battery Condition Compiler cache.')
+parser.add_argument('--agent_cache_path', type=str, default='', help='Path to the offline Battery Condition Compiler cache pickle.')
+parser.add_argument('--agent_conf_threshold', type=float, default=0.0, help='Reserved confidence threshold for agent-guided routing.')
+parser.add_argument('--agent_embed_mix', type=float, default=0.5, help='Reserved blend ratio between DKP and agent condition embeddings.')
+parser.add_argument('--agent_gate_bias_scale', type=float, default=1.0, help='Reserved scale factor for agent-derived gate priors.')
+parser.add_argument('--agent_use_curriculum', action='store_true', default=False, help='Reserved switch to use agent curriculum weights.')
+parser.add_argument('--agent_use_gate_prior', action='store_true', default=False, help='Reserved switch to use agent gate priors.')
+parser.add_argument('--agent_debug', action='store_true', default=False, help='Reserved debug switch for agent plumbing.')
+
 # Evaluation alpha-accuracy
 parser.add_argument('--alpha1', type=float, default=0.15, help='the alpha for alpha-accuracy')
 parser.add_argument('--alpha2', type=float, default=0.1, help='the alpha for alpha-accuracy')
@@ -365,11 +382,27 @@ args_path = args.args_path
 dataset = args.eval_dataset
 alpha = args.alpha1
 alpha2 = args.alpha2
+use_agent = args.use_agent
+agent_cache_path = args.agent_cache_path
+agent_conf_threshold = args.agent_conf_threshold
+agent_embed_mix = args.agent_embed_mix
+agent_gate_bias_scale = args.agent_gate_bias_scale
+agent_use_curriculum = args.agent_use_curriculum
+agent_use_gate_prior = args.agent_use_gate_prior
+agent_debug = args.agent_debug
 args_json = json.load(open(f'{args_path}args.json'))
 trained_dataset = args_json['dataset']
 dataset = dataset if 'finetune_method' not in args_json else args_json['dataset']
 args_json['dataset'] = dataset 
 args_json['batch_size'] = batch_size
+args_json['use_agent'] = use_agent
+args_json['agent_cache_path'] = agent_cache_path
+args_json['agent_conf_threshold'] = agent_conf_threshold
+args_json['agent_embed_mix'] = agent_embed_mix
+args_json['agent_gate_bias_scale'] = agent_gate_bias_scale
+args_json['agent_use_curriculum'] = agent_use_curriculum
+args_json['agent_use_gate_prior'] = agent_use_gate_prior
+args_json['agent_debug'] = agent_debug
 
 args.__dict__ = args_json
 
@@ -502,14 +535,16 @@ for ii in range(args.itr):
     total_seen_number_of_cycles = []
     model.eval() # set the model to evaluation mode
     with torch.no_grad():
-        for i, (cycle_curve_data, curve_attn_mask, labels, weights, dataset_ids, seen_unseen_ids, DKP_embeddings, cathode_masks, temperature_masks, format_masks, anode_masks, ion_type_masks, combined_masks, domain_ids) in tqdm(enumerate(test_loader)):
+        for i, (cycle_curve_data, curve_attn_mask, labels, weights, dataset_ids, seen_unseen_ids, DKP_embeddings, cathode_masks, temperature_masks, format_masks, anode_masks, ion_type_masks, combined_masks, domain_ids, agent_cond_embeds, agent_gate_priors, agent_confidences, agent_sample_weights) in tqdm(enumerate(test_loader)):
 
 
             seen_number_of_cycles = torch.sum(curve_attn_mask, dim=1) # [B]
+            maybe_print_agent_debug(args, accelerator, agent_confidences)
+            agent_model_kwargs = build_agent_model_kwargs(args, agent_cond_embeds, agent_gate_priors, agent_confidences)
             # encoder - decoder
             outputs, prompt_scores, llm_out, feature_llm_out, _, alpha_exponent, aug_loss, guide_loss = model(cycle_curve_data, curve_attn_mask, 
             DKP_embeddings=DKP_embeddings, cathode_masks=cathode_masks, temperature_masks=temperature_masks, format_masks=format_masks, 
-            anode_masks=anode_masks, ion_type_masks=ion_type_masks, combined_masks=combined_masks)
+            anode_masks=anode_masks, ion_type_masks=ion_type_masks, combined_masks=combined_masks, **agent_model_kwargs)
             # self.accelerator.wait_for_everyone()
             transformed_preds = outputs * std + mean_value
             transformed_labels = labels * std + mean_value

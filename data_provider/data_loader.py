@@ -22,10 +22,12 @@ import json
 from torch.nn.utils.rnn import pad_sequence
 from batteryml.data.battery_data import BatteryData
 from utils.augmentation import BatchAugmentation_battery_revised
+from agent.cache import get_agent_entry, load_agent_cache
 from data_provider.data_split_recorder import split_recorder
 from data_provider.gate_masker import gate_masker
 import accelerate
 warnings.filterwarnings('ignore')
+GATE_DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'gate_data')
 datasetName2ids = {
     'CALCE':0,
     'HNEI':1,
@@ -172,11 +174,15 @@ def my_collate_fn_withId(samples):
     dataset_ids = torch.Tensor([i['dataset_id'] for i in samples])
     domain_ids = torch.Tensor([i['domain_ids'] for i in samples])
     seen_unseen_ids = torch.Tensor([i['seen_unseen_id'] for i in samples])
+    agent_cond_embeds = torch.vstack([i['agent_cond_embed'].unsqueeze(0) for i in samples])
+    agent_gate_priors = torch.vstack([i['agent_gate_prior'].unsqueeze(0) for i in samples])
+    agent_confidences = torch.Tensor([i['agent_confidence'] for i in samples])
+    agent_sample_weights = torch.Tensor([i['agent_sample_weight'] for i in samples])
 
     tmp_curve_attn_mask = curve_attn_mask.unsqueeze(-1).unsqueeze(-1) * torch.ones_like(cycle_curve_data)
     cycle_curve_data[tmp_curve_attn_mask==0] = 0 # set the unseen data as zeros
     
-    return cycle_curve_data, curve_attn_mask, labels, weights, dataset_ids, seen_unseen_ids, DKP_embeddings, cathode_masks, temperature_masks, format_masks, anode_masks, ion_type_masks, combined_masks, domain_ids
+    return cycle_curve_data, curve_attn_mask, labels, weights, dataset_ids, seen_unseen_ids, DKP_embeddings, cathode_masks, temperature_masks, format_masks, anode_masks, ion_type_masks, combined_masks, domain_ids, agent_cond_embeds, agent_gate_priors, agent_confidences, agent_sample_weights
 
 def my_collate_fn(samples):
     cycle_curve_data = torch.vstack([i['cycle_curve_data'].unsqueeze(0) for i in samples])
@@ -199,11 +205,15 @@ def my_collate_fn(samples):
     DKP_embeddings = torch.vstack([i['DKP_embedding'] for i in samples])
     seen_unseen_ids = torch.Tensor([i['seen_unseen_id'] for i in samples])
     domain_ids = torch.Tensor([i['domain_ids'] for i in samples])
+    agent_cond_embeds = torch.vstack([i['agent_cond_embed'].unsqueeze(0) for i in samples])
+    agent_gate_priors = torch.vstack([i['agent_gate_prior'].unsqueeze(0) for i in samples])
+    agent_confidences = torch.Tensor([i['agent_confidence'] for i in samples])
+    agent_sample_weights = torch.Tensor([i['agent_sample_weight'] for i in samples])
 
     tmp_curve_attn_mask = curve_attn_mask.unsqueeze(-1).unsqueeze(-1) * torch.ones_like(cycle_curve_data)
     cycle_curve_data[tmp_curve_attn_mask==0] = 0 # set the unseen data as zeros
 
-    return cycle_curve_data, curve_attn_mask, labels, weights, file_names, DKP_embeddings, seen_unseen_ids, cathode_masks, temperature_masks, format_masks, anode_masks, ion_type_masks, combined_masks, domain_ids
+    return cycle_curve_data, curve_attn_mask, labels, weights, file_names, DKP_embeddings, seen_unseen_ids, cathode_masks, temperature_masks, format_masks, anode_masks, ion_type_masks, combined_masks, domain_ids, agent_cond_embeds, agent_gate_priors, agent_confidences, agent_sample_weights
 
 # BatterLifeLLM dataloader
 class Dataset_PBT(Dataset):
@@ -228,13 +238,16 @@ class Dataset_PBT(Dataset):
         self.flag = flag
         self.dataset = args.dataset if not use_target_dataset else args.target_dataset
         self.early_cycle_threshold = args.early_cycle_threshold
-        self.cathode_json = json.load(open('./gate_data/cathodes.json'))
+        self.use_agent = bool(getattr(args, 'use_agent', False))
+        self.agent_cache_path = getattr(args, 'agent_cache_path', '')
+        self.agent_cache = load_agent_cache(self.agent_cache_path) if self.use_agent else {}
+        self.cathode_json = json.load(open(os.path.join(GATE_DATA_DIR, 'cathodes.json')))
         self.cathode_experts = args.cathode_experts
-        self.temperature_json = json.load(open('./gate_data/temperatures.json'))
+        self.temperature_json = json.load(open(os.path.join(GATE_DATA_DIR, 'temperatures.json')))
         self.temperature_experts = args.temperature_experts
-        self.format_json = json.load(open('./gate_data/formats.json'))
+        self.format_json = json.load(open(os.path.join(GATE_DATA_DIR, 'formats.json')))
         self.format_experts = args.format_experts
-        self.anode_json = json.load(open('./gate_data/anodes.json'))
+        self.anode_json = json.load(open(os.path.join(GATE_DATA_DIR, 'anodes.json')))
         self.anode_experts = args.anode_experts
         self.ion_experts = args.ion_experts
         self.trained_dataset = trained_dataset
@@ -245,7 +258,7 @@ class Dataset_PBT(Dataset):
         self.anode2mask = anode2mask
         self.ion2mask = ion2mask
 
-        self.name2domainID = json.load(open(f'/data/trf/python_works/PBT/gate_data/name2agingConditionID.json'))
+        self.name2domainID = json.load(open(os.path.join(GATE_DATA_DIR, 'name2agingConditionID.json')))
 
         self.label_prompts_vectors = {}
         self.need_keys = ['current_in_A', 'voltage_in_V', 'charge_capacity_in_Ah', 'discharge_capacity_in_Ah', 'time_in_s']
@@ -1237,6 +1250,19 @@ class Dataset_PBT(Dataset):
         # res = self.tokenizer(label_prompt, return_tensors="pt", truncation=True, padding='max_length', max_length=max_length)
         # label_input_ids, label_attention_mask = res['input_ids'][0][end_cut_off:], res['attention_mask'][0][end_cut_off:]
 
+        file_name = self.total_file_names[index]
+        cell_name = file_name.split('.pkl')[0]
+        combined_mask = self.total_combined_expert_masks[index]
+        agent_entry = get_agent_entry(
+            self.agent_cache,
+            file_name=file_name,
+            cell_name=cell_name,
+            d_llm=getattr(self.args, 'd_llm', len(self.total_DKP_embeddings[index])),
+            num_total_experts=len(combined_mask),
+            fallback_embed=self.total_DKP_embeddings[index],
+            fallback_combined_mask=combined_mask,
+        )
+
         sample = {
                 'cycle_curve_data': torch.Tensor(self.total_charge_discharge_curves[index]),
                 'curve_attn_mask': torch.Tensor(self.total_curve_attn_masks[index]),
@@ -1248,12 +1274,16 @@ class Dataset_PBT(Dataset):
                 'temperature_mask': torch.Tensor(self.total_temperature_experts_masks[index]),
                 'format_mask': torch.Tensor(self.total_format_expert_masks[index]),
                 'ion_type_mask': torch.Tensor(self.total_ion_type_masks[index]),
-                'combined_mask': torch.Tensor(self.total_combined_expert_masks[index]),
+                'combined_mask': torch.Tensor(combined_mask),
                 'DKP_embedding': torch.from_numpy(self.total_DKP_embeddings[index]),
                 'cluster_label': self.total_cluster_labels[index],
-                'file_name': self.total_file_names[index],
+                'file_name': file_name,
                 'seen_unseen_id': self.total_seen_unseen_IDs[index],
-                'domain_ids': self.total_domain_ids[index]
+                'domain_ids': self.total_domain_ids[index],
+                'agent_cond_embed': torch.tensor(agent_entry['cond_embed'], dtype=torch.float32),
+                'agent_gate_prior': torch.tensor(agent_entry['gate_prior'], dtype=torch.float32),
+                'agent_confidence': agent_entry['confidence'],
+                'agent_sample_weight': agent_entry['curriculum_weight'],
             }
         return sample
  

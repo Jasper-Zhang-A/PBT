@@ -31,7 +31,15 @@ def list_of_ints(arg):
 # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
 os.environ["CUDA_LAUNCH_BLOCKING"] = '1'
 os.environ["TORCH_USE_CUDA_DSA"] = "true"
-from utils.tools import del_files, EarlyStopping, adjust_learning_rate, vali_batteryLifeLLM
+from utils.tools import (
+    del_files,
+    EarlyStopping,
+    adjust_learning_rate,
+    vali_batteryLifeLLM,
+    build_agent_model_kwargs,
+    maybe_apply_agent_curriculum,
+    maybe_print_agent_debug,
+)
 
 parser = argparse.ArgumentParser(description='BatteryLifeLLM')
 
@@ -174,6 +182,16 @@ parser.add_argument('--wo_DKPrompt', action='store_true', default=False, help='S
 
 # BatteryFormer
 parser.add_argument('--charge_discharge_length', type=int, default=100, help='The resampled length for charge and discharge curves')
+
+# Agent MVP
+parser.add_argument('--use_agent', action='store_true', default=False, help='Set True to load the offline Battery Condition Compiler cache.')
+parser.add_argument('--agent_cache_path', type=str, default='', help='Path to the offline Battery Condition Compiler cache pickle.')
+parser.add_argument('--agent_conf_threshold', type=float, default=0.0, help='Reserved confidence threshold for agent-guided routing.')
+parser.add_argument('--agent_embed_mix', type=float, default=0.5, help='Reserved blend ratio between DKP and agent condition embeddings.')
+parser.add_argument('--agent_gate_bias_scale', type=float, default=1.0, help='Reserved scale factor for agent-derived gate priors.')
+parser.add_argument('--agent_use_curriculum', action='store_true', default=False, help='Reserved switch to use agent curriculum weights.')
+parser.add_argument('--agent_use_gate_prior', action='store_true', default=False, help='Reserved switch to use agent gate priors.')
+parser.add_argument('--agent_debug', action='store_true', default=False, help='Reserved debug switch for agent plumbing.')
 
 # Evaluation alpha-accuracy
 parser.add_argument('--alpha1', type=float, default=0.15, help='the alpha for alpha-accuracy')
@@ -374,7 +392,7 @@ for ii in range(args.itr):
         print_label_loss = 0
         std, mean_value = np.sqrt(train_data.label_scaler.var_[-1]), train_data.label_scaler.mean_[-1]
         total_preds, total_references = [], []
-        for i, (cycle_curve_data, curve_attn_mask, labels, weights, _, DKP_embeddings, _, cathode_masks, temperature_masks, format_masks, anode_masks, ion_type_masks, combined_masks, domain_ids) in enumerate(train_loader):
+        for i, (cycle_curve_data, curve_attn_mask, labels, weights, _, DKP_embeddings, _, cathode_masks, temperature_masks, format_masks, anode_masks, ion_type_masks, combined_masks, domain_ids, agent_cond_embeds, agent_gate_priors, agent_confidences, agent_sample_weights) in enumerate(train_loader):
             with accelerator.accumulate(model):
                 if epoch < args.warm_up_epoches:
                     # adjust the learning rate
@@ -390,10 +408,13 @@ for ii in range(args.itr):
 
                 
                 iter_count += 1
+                maybe_print_agent_debug(args, accelerator, agent_confidences)
+                weights = maybe_apply_agent_curriculum(args, weights, agent_sample_weights)
+                agent_model_kwargs = build_agent_model_kwargs(args, agent_cond_embeds, agent_gate_priors, agent_confidences)
                 # encoder - decoder
                 outputs, _, _, _, _, _, LB_loss, _ = model(cycle_curve_data, curve_attn_mask, 
                 DKP_embeddings=DKP_embeddings, cathode_masks=cathode_masks, temperature_masks=temperature_masks, format_masks=format_masks, 
-                anode_masks=anode_masks, combined_masks=combined_masks, ion_type_masks=ion_type_masks)
+                anode_masks=anode_masks, combined_masks=combined_masks, ion_type_masks=ion_type_masks, **agent_model_kwargs)
                 
 
                 loss = criterion(outputs, labels)

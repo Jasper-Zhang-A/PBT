@@ -14,6 +14,54 @@ from torch import nn
 from utils.losses import WeightedRnCLoss
 import wandb
 plt.switch_backend('agg')
+SUPPORTED_AGENT_MODELS = {'CPMLP', 'CPTransformer', 'PBT'}
+
+
+def build_agent_model_kwargs(args, agent_cond_embeds, agent_gate_priors, agent_confidences):
+    if getattr(args, 'model', None) not in SUPPORTED_AGENT_MODELS:
+        return {}
+    return {
+        'agent_cond_embed': agent_cond_embeds,
+        'agent_gate_prior': agent_gate_priors,
+        'agent_confidence': agent_confidences,
+    }
+
+
+def maybe_apply_agent_curriculum(args, weights, agent_sample_weights):
+    if not getattr(args, 'use_agent', False):
+        return weights
+    if not getattr(args, 'agent_use_curriculum', False):
+        return weights
+    return weights * agent_sample_weights.to(device=weights.device, dtype=weights.dtype)
+
+
+def maybe_print_agent_debug(args, accelerator, agent_confidences):
+    if not getattr(args, 'use_agent', False):
+        return
+    if not getattr(args, 'agent_debug', False):
+        return
+    if getattr(args, '_agent_debug_printed', False):
+        return
+
+    if agent_confidences is None:
+        mean_confidence = 0.0
+        above_threshold = 0.0
+    else:
+        confidences = agent_confidences.detach().float()
+        mean_confidence = confidences.mean().item() if confidences.numel() > 0 else 0.0
+        threshold = float(getattr(args, 'agent_conf_threshold', 0.0))
+        above_threshold = (confidences >= threshold).float().mean().item() if confidences.numel() > 0 else 0.0
+
+    process_index = accelerator.process_index if accelerator is not None else 0
+    print(
+        f"[agent_debug][rank {process_index}] mean_confidence={mean_confidence:.4f} "
+        f"fraction_above_threshold={above_threshold:.4f} "
+        f"curriculum_enabled={bool(getattr(args, 'agent_use_curriculum', False))} "
+        f"gate_prior_enabled={bool(getattr(args, 'agent_use_gate_prior', False))}"
+    )
+    setattr(args, '_agent_debug_printed', True)
+
+
 def split_meta_domains(domain_ids, K):
     """
     Splits the domain_ids into meta-train and meta-test domains based on K% test domains.
@@ -267,7 +315,7 @@ def vali_batteryLifeLLM(args, accelerator, model, vali_data, vali_loader, criter
     total_seen_unseen_ids = []
     std, mean_value = np.sqrt(vali_data.label_scaler.var_[-1]), vali_data.label_scaler.mean_[-1]
     with torch.no_grad():
-        for i, (cycle_curve_data, curve_attn_mask, labels, _,  _, DKP_embeddings, seen_unseen_ids, cathode_masks, temperature_masks, format_masks, anode_masks, ion_type_masks, combined_masks, domain_ids) in enumerate(vali_loader):
+        for i, (cycle_curve_data, curve_attn_mask, labels, _,  _, DKP_embeddings, seen_unseen_ids, cathode_masks, temperature_masks, format_masks, anode_masks, ion_type_masks, combined_masks, domain_ids, agent_cond_embeds, agent_gate_priors, agent_confidences, agent_sample_weights) in enumerate(vali_loader):
             if accelerator is None:
                 # use the GPU manually
                 cycle_curve_data = cycle_curve_data.to(torch.bfloat16).cuda()
@@ -278,13 +326,18 @@ def vali_batteryLifeLLM(args, accelerator, model, vali_data, vali_loader, criter
                 format_masks = format_masks.to(torch.bfloat16).cuda()
                 anode_masks = anode_masks.to(torch.bfloat16).cuda()
                 combined_masks = combined_masks.to(torch.bfloat16).cuda()
+                agent_cond_embeds = agent_cond_embeds.cuda()
+                agent_gate_priors = agent_gate_priors.cuda()
+                agent_confidences = agent_confidences.cuda()
                 labels = labels.cuda()
 
+            maybe_print_agent_debug(args, accelerator, agent_confidences)
+            agent_model_kwargs = build_agent_model_kwargs(args, agent_cond_embeds, agent_gate_priors, agent_confidences)
 
             # encoder - decoder
             outputs, _, _, _, _, _, _, _ = model(cycle_curve_data, curve_attn_mask, DKP_embeddings=DKP_embeddings, cathode_masks=cathode_masks
                                                  , temperature_masks=temperature_masks, format_masks=format_masks, anode_masks=anode_masks,
-                                                 combined_masks=combined_masks, ion_type_masks=ion_type_masks)
+                                                 combined_masks=combined_masks, ion_type_masks=ion_type_masks, **agent_model_kwargs)
             # self.accelerator.wait_for_everyone()
             
             transformed_preds = outputs * std + mean_value
@@ -393,7 +446,7 @@ def domain_average(total_domain_ids, MAPEs, return_IDs=False):
     total_seen_unseen_ids = []
     std, mean_value = np.sqrt(vali_data.label_scaler.var_[-1]), vali_data.label_scaler.mean_[-1]
     with torch.no_grad():
-        for i, (cycle_curve_data, curve_attn_mask, labels, _,  _, DKP_embeddings, seen_unseen_ids, cathode_masks, temperature_masks, format_masks, anode_masks, ion_type_masks, combined_masks, domain_ids) in enumerate(vali_loader):
+        for i, (cycle_curve_data, curve_attn_mask, labels, _,  _, DKP_embeddings, seen_unseen_ids, cathode_masks, temperature_masks, format_masks, anode_masks, ion_type_masks, combined_masks, domain_ids, agent_cond_embeds, agent_gate_priors, agent_confidences, agent_sample_weights) in enumerate(vali_loader):
             if accelerator is None:
                 # use the GPU manually
                 cycle_curve_data = cycle_curve_data.to(torch.bfloat16).cuda()
@@ -404,13 +457,18 @@ def domain_average(total_domain_ids, MAPEs, return_IDs=False):
                 format_masks = format_masks.to(torch.bfloat16).cuda()
                 anode_masks = anode_masks.to(torch.bfloat16).cuda()
                 combined_masks = combined_masks.to(torch.bfloat16).cuda()
+                agent_cond_embeds = agent_cond_embeds.cuda()
+                agent_gate_priors = agent_gate_priors.cuda()
+                agent_confidences = agent_confidences.cuda()
                 labels = labels.cuda()
 
+            maybe_print_agent_debug(args, accelerator, agent_confidences)
+            agent_model_kwargs = build_agent_model_kwargs(args, agent_cond_embeds, agent_gate_priors, agent_confidences)
 
             # encoder - decoder
             outputs = model(cycle_curve_data, curve_attn_mask, DKP_embeddings=DKP_embeddings, cathode_masks=cathode_masks
                                                  , temperature_masks=temperature_masks, format_masks=format_masks, anode_masks=anode_masks,
-                                                 combined_masks=combined_masks, ion_type_masks=ion_type_masks, use_aug=False)
+                                                 combined_masks=combined_masks, ion_type_masks=ion_type_masks, use_aug=False, **agent_model_kwargs)
             # self.accelerator.wait_for_everyone()
             
             transformed_preds = outputs * std + mean_value

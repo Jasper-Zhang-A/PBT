@@ -247,7 +247,15 @@ def list_of_ints(arg):
 # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
 os.environ["CUDA_LAUNCH_BLOCKING"] = '1'
 os.environ["TORCH_USE_CUDA_DSA"] = "true"
-from utils.tools import del_files, EarlyStopping, adjust_learning_rate, vali_batteryLifeLLM
+from utils.tools import (
+    del_files,
+    EarlyStopping,
+    adjust_learning_rate,
+    vali_batteryLifeLLM,
+    build_agent_model_kwargs,
+    maybe_apply_agent_curriculum,
+    maybe_print_agent_debug,
+)
 
 parser = argparse.ArgumentParser(description='BatteryLifeLLM')
 
@@ -386,6 +394,16 @@ parser.add_argument('--wo_DKPrompt', action='store_true', default=False, help='S
 # BatteryFormer
 parser.add_argument('--charge_discharge_length', type=int, default=100, help='The resampled length for charge and discharge curves')
 
+# Agent MVP
+parser.add_argument('--use_agent', action='store_true', default=False, help='Set True to load the offline Battery Condition Compiler cache.')
+parser.add_argument('--agent_cache_path', type=str, default='', help='Path to the offline Battery Condition Compiler cache pickle.')
+parser.add_argument('--agent_conf_threshold', type=float, default=0.0, help='Reserved confidence threshold for agent-guided routing.')
+parser.add_argument('--agent_embed_mix', type=float, default=0.5, help='Reserved blend ratio between DKP and agent condition embeddings.')
+parser.add_argument('--agent_gate_bias_scale', type=float, default=1.0, help='Reserved scale factor for agent-derived gate priors.')
+parser.add_argument('--agent_use_curriculum', action='store_true', default=False, help='Reserved switch to use agent curriculum weights.')
+parser.add_argument('--agent_use_gate_prior', action='store_true', default=False, help='Reserved switch to use agent gate priors.')
+parser.add_argument('--agent_debug', action='store_true', default=False, help='Reserved debug switch for agent plumbing.')
+
 # Evaluation alpha-accuracy
 parser.add_argument('--alpha1', type=float, default=0.15, help='the alpha for alpha-accuracy')
 parser.add_argument('--alpha2', type=float, default=0.1, help='the alpha for alpha-accuracy')
@@ -416,6 +434,14 @@ eval_metric = args.eval_metric
 early_cycle_threshold = args.early_cycle_threshold
 seq_len = args.seq_len
 root_path = args.root_path
+use_agent = args.use_agent
+agent_cache_path = args.agent_cache_path
+agent_conf_threshold = args.agent_conf_threshold
+agent_embed_mix = args.agent_embed_mix
+agent_gate_bias_scale = args.agent_gate_bias_scale
+agent_use_curriculum = args.agent_use_curriculum
+agent_use_gate_prior = args.agent_use_gate_prior
+agent_debug = args.agent_debug
 
 args_json = json.load(open(f'{args_path}args.json'))
 trained_dataset = args_json['dataset']
@@ -449,6 +475,14 @@ args_json['train_epochs'] = args.train_epochs
 args_json['finetune_method'] = args.finetune_method
 args_json['adapter_size'] = args.adapter_size
 args_json['loss'] = args.loss
+args_json['use_agent'] = use_agent
+args_json['agent_cache_path'] = agent_cache_path
+args_json['agent_conf_threshold'] = agent_conf_threshold
+args_json['agent_embed_mix'] = agent_embed_mix
+args_json['agent_gate_bias_scale'] = agent_gate_bias_scale
+args_json['agent_use_curriculum'] = agent_use_curriculum
+args_json['agent_use_gate_prior'] = agent_use_gate_prior
+args_json['agent_debug'] = agent_debug
 pretrain_warm_up_epoches = args_json['warm_up_epoches']
 args_json['warm_up_epoches'] = args.warm_up_epoches
 args_json['model_comment'] = args.model_comment
@@ -584,7 +618,7 @@ for ii in range(args.itr):
                 model = add_adapters_withCP(args, model, args.adapter_size) # add adapters before and after that flattenIntra
                 for name, p in model.named_parameters():
                     # only tune the adapters + gate + head
-                    if 'adapter' in name or 'gate' in name or 'regression_head' in name:
+                    if 'adapter' in name or 'gate' in name or 'regression_head' in name or 'head_output' in name or 'projection' in name or 'agent_' in name or 'fusion_' in name:
                         if p.requires_grad is True:
                             trained_parameters_names.append(name)
                             trained_parameters.append(p)
@@ -593,7 +627,7 @@ for ii in range(args.itr):
                 model = add_adapters_withoutCP(args, model, args.adapter_size) # add adapters before and after that flattenIntra
                 for name, p in model.named_parameters():
                     # only tune the adapters + gate + head
-                    if 'adapter' in name or 'gate' in name or 'regression_head' in name:
+                    if 'adapter' in name or 'gate' in name or 'regression_head' in name or 'head_output' in name or 'projection' in name or 'agent_' in name or 'fusion_' in name:
                         if p.requires_grad is True:
                             trained_parameters_names.append(name)
                             trained_parameters.append(p)
@@ -668,7 +702,7 @@ for ii in range(args.itr):
         print_label_loss = 0
         std, mean_value = np.sqrt(train_data.label_scaler.var_[-1]), train_data.label_scaler.mean_[-1]
         total_preds, total_references = [], []
-        for i, (cycle_curve_data, curve_attn_mask, labels, weights, _, DKP_embeddings, _, cathode_masks, temperature_masks, format_masks, anode_masks, ion_type_masks, combined_masks, domain_ids) in enumerate(train_loader):
+        for i, (cycle_curve_data, curve_attn_mask, labels, weights, _, DKP_embeddings, _, cathode_masks, temperature_masks, format_masks, anode_masks, ion_type_masks, combined_masks, domain_ids, agent_cond_embeds, agent_gate_priors, agent_confidences, agent_sample_weights) in enumerate(train_loader):
             with accelerator.accumulate(model):
                 # batch_x_mark is the total_masks
                 # batch_y_mark is the total_used_cycles
@@ -686,11 +720,14 @@ for ii in range(args.itr):
 
                 model_optim.zero_grad()
                 iter_count += 1
+                maybe_print_agent_debug(args, accelerator, agent_confidences)
+                weights = maybe_apply_agent_curriculum(args, weights, agent_sample_weights)
+                agent_model_kwargs = build_agent_model_kwargs(args, agent_cond_embeds, agent_gate_priors, agent_confidences)
 
                 # encoder - decoder
                 outputs, _, _, _, _, alpha_exponent, aug_loss, guide_loss = model(cycle_curve_data, curve_attn_mask, 
                 DKP_embeddings=DKP_embeddings, cathode_masks=cathode_masks, temperature_masks=temperature_masks, format_masks=format_masks, 
-                anode_masks=anode_masks, combined_masks=combined_masks, ion_type_masks=ion_type_masks, use_view_experts=use_view_experts)
+                anode_masks=anode_masks, combined_masks=combined_masks, ion_type_masks=ion_type_masks, use_view_experts=use_view_experts, **agent_model_kwargs)
                 
 
                 loss = criterion(outputs, labels)

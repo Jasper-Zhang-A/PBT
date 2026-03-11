@@ -27,10 +27,10 @@ class PBTCPLayerWithAdapter(nn.Module):
         self.original_layer = original_layer
         self.top_adapter = Adapter(configs.d_model, adapter_size)
         
-    def forward(self, cycle_curve_data, DKP_embeddings, total_masks, ion_type_masks, use_view_experts):
+    def forward(self, cycle_curve_data, DKP_embeddings, total_masks, ion_type_masks, use_view_experts, gate_bias=None):
         out = self.bottom_adapter(cycle_curve_data) # [B, L, 3*charge_discharge_length]
         # Run original layer
-        out, guide_loss, LB_loss = self.original_layer(cycle_curve_data, DKP_embeddings, total_masks, ion_type_masks=ion_type_masks, use_view_experts=use_view_experts)
+        out, guide_loss, LB_loss = self.original_layer(cycle_curve_data, DKP_embeddings, total_masks, ion_type_masks=ion_type_masks, use_view_experts=use_view_experts, gate_bias=gate_bias)
         # Run the adapter
         out = self.top_adapter(out)
         return out, guide_loss, LB_loss 

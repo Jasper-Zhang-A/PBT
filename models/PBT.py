@@ -46,7 +46,7 @@ class BatteryMoEMLPLayer(nn.Module):
         if self.use_norm:
             self.norm = norm_layer
 
-    def forward(self, x, gate_input, total_masks, ion_type_masks, use_view_experts):
+    def forward(self, x, gate_input, total_masks, ion_type_masks, use_view_experts, gate_bias=None):
         '''
         x: [N, *, in_dim]
         gate_input: [B, gate_input_dim]
@@ -59,6 +59,12 @@ class BatteryMoEMLPLayer(nn.Module):
         total_LB_loss = 0
         final_out = 0
         total_logits = self.expert_gate(gate_input) # [B, num_experts]
+        if gate_bias is not None:
+            assert gate_bias.shape == total_logits.shape, (
+                f'BatteryMoEMLPLayer expected gate_bias shape {tuple(total_logits.shape)}, '
+                f'but got {tuple(gate_bias.shape)}.'
+            )
+            total_logits = total_logits + gate_bias.to(device=total_logits.device, dtype=total_logits.dtype)
        
         if use_view_experts:
             for i, view_expert in enumerate(self.view_experts):
@@ -94,7 +100,7 @@ class BatteryMoETransformerLayer(nn.Module):
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
 
-    def forward(self, x, gate_input, total_masks, attn_mask, ion_type_masks, use_view_experts):
+    def forward(self, x, gate_input, total_masks, attn_mask, ion_type_masks, use_view_experts, gate_bias=None):
         '''
         x: [N, *, in_dim]
         gate_input: [B, gate_input_dim]
@@ -117,6 +123,12 @@ class BatteryMoETransformerLayer(nn.Module):
         total_LB_loss = 0
         final_out = 0
         total_logits = self.expert_gate(gate_input) # [B, num_experts]
+        if gate_bias is not None:
+            assert gate_bias.shape == total_logits.shape, (
+                f'BatteryMoETransformerLayer expected gate_bias shape {tuple(total_logits.shape)}, '
+                f'but got {tuple(gate_bias.shape)}.'
+            )
+            total_logits = total_logits + gate_bias.to(device=total_logits.device, dtype=total_logits.dtype)
         if use_view_experts:
             for i, view_expert in enumerate(self.view_experts):
                 out, guide_loss, LB_loss = view_expert(x, total_logits, total_masks[i])
@@ -508,6 +520,11 @@ class Model(nn.Module):
         self.num_general_experts = configs.num_general_experts
         self.num_views = configs.num_views
         self.down_sample_ratio = configs.down_sample_ratio
+        self.use_agent = getattr(configs, 'use_agent', False)
+        self.agent_embed_mix = float(getattr(configs, 'agent_embed_mix', 0.5))
+        self.agent_gate_bias_scale = float(getattr(configs, 'agent_gate_bias_scale', 1.0))
+        self.agent_conf_threshold = float(getattr(configs, 'agent_conf_threshold', 0.0))
+        self.agent_use_gate_prior = bool(getattr(configs, 'agent_use_gate_prior', False))
 
         self.cathode_split = self.cathode_experts
         self.num_experts = self.cathode_experts + self.anode_experts + self.temperature_experts + self.format_experts
@@ -564,6 +581,53 @@ class Model(nn.Module):
                                                         nn.Linear(self.d_model, configs.output_num) for _ in range(1)
                                                     ]))
 
+    def _assert_agent_inputs(self, batch_size, agent_cond_embed, agent_gate_prior):
+        assert agent_cond_embed is not None, 'PBT expected agent_cond_embed when args.use_agent is true.'
+        assert agent_cond_embed.dim() == 2 and agent_cond_embed.shape == (batch_size, self.d_llm), (
+            f'PBT expected agent_cond_embed shape [{batch_size}, {self.d_llm}], '
+            f'but got {tuple(agent_cond_embed.shape)}.'
+        )
+        assert agent_gate_prior is not None, 'PBT expected agent_gate_prior when args.use_agent is true.'
+        assert agent_gate_prior.dim() == 2 and agent_gate_prior.shape == (batch_size, self.num_experts), (
+            f'PBT expected agent_gate_prior shape [{batch_size}, {self.num_experts}], '
+            f'but got {tuple(agent_gate_prior.shape)}.'
+        )
+
+    def _prepare_agent_confidence(self, batch_size, agent_confidence, device, dtype):
+        if agent_confidence is None:
+            return torch.zeros(batch_size, 1, device=device, dtype=dtype)
+        if agent_confidence.dim() == 1:
+            agent_confidence = agent_confidence.unsqueeze(-1)
+        else:
+            assert agent_confidence.dim() == 2 and agent_confidence.shape[1] == 1, (
+                f'PBT expected agent_confidence shape [{batch_size}] or [{batch_size}, 1], '
+                f'but got {tuple(agent_confidence.shape)}.'
+            )
+        assert agent_confidence.shape[0] == batch_size, (
+            f'PBT expected agent_confidence batch size {batch_size}, '
+            f'but got {agent_confidence.shape[0]}.'
+        )
+        return agent_confidence.to(device=device, dtype=dtype)
+
+    def _build_agent_controls(self, DKP_embeddings, agent_cond_embed, agent_gate_prior, agent_confidence):
+        batch_size = DKP_embeddings.shape[0]
+        self._assert_agent_inputs(batch_size, agent_cond_embed, agent_gate_prior)
+        agent_confidence = self._prepare_agent_confidence(
+            batch_size, agent_confidence, DKP_embeddings.device, DKP_embeddings.dtype
+        )
+        agent_cond_embed = agent_cond_embed.to(device=DKP_embeddings.device, dtype=DKP_embeddings.dtype)
+        mix_ratio = torch.clamp(agent_confidence * self.agent_embed_mix, min=0.0, max=1.0)
+        mixed_embeddings = DKP_embeddings * (1 - mix_ratio) + agent_cond_embed * mix_ratio
+
+        gate_bias = None
+        if self.agent_use_gate_prior:
+            gate_prior = agent_gate_prior.to(device=DKP_embeddings.device, dtype=DKP_embeddings.dtype)
+            gate_prior = gate_prior / gate_prior.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            active_gate_mask = (agent_confidence >= self.agent_conf_threshold).to(dtype=DKP_embeddings.dtype)
+            gate_bias = gate_prior * active_gate_mask * self.agent_gate_bias_scale
+
+        return mixed_embeddings, gate_bias
+
 
     def forward(self, cycle_curve_data, curve_attn_mask, 
                 attention_mask: Optional[torch.Tensor] = None,
@@ -574,6 +638,9 @@ class Model(nn.Module):
                 anode_masks: Optional[torch.Tensor] = None,
                 ion_type_masks: Optional[torch.Tensor] = None,
                 combined_masks: Optional[torch.Tensor] = None,
+                agent_cond_embed: Optional[torch.Tensor] = None,
+                agent_gate_prior: Optional[torch.Tensor] = None,
+                agent_confidence: Optional[torch.Tensor] = None,
                 return_embedding: bool=False,
                 use_view_experts: bool=True
                 ):
@@ -586,6 +653,11 @@ class Model(nn.Module):
         B, L, num_var, fixed_len = cycle_curve_data.shape[0], cycle_curve_data.shape[1], cycle_curve_data.shape[2], cycle_curve_data.shape[3]
         cycle_curve_data, curve_attn_mask = cycle_curve_data.to(torch.bfloat16), curve_attn_mask.to(torch.bfloat16)
         DKP_embeddings = DKP_embeddings.to(torch.bfloat16)
+        gate_bias = None
+        if self.use_agent:
+            DKP_embeddings, gate_bias = self._build_agent_controls(
+                DKP_embeddings, agent_cond_embed, agent_gate_prior, agent_confidence
+            )
 
         total_masks = [combined_masks]
 
@@ -600,14 +672,14 @@ class Model(nn.Module):
 
         # cycle_curve_data = self.view_linear(cycle_curve_data) # flatten & linear
         cycle_curve_data = self.flatten(cycle_curve_data)
-        out, guide_loss, LB_loss = self.flattenIntraCycleLayer(cycle_curve_data, DKP_embeddings, total_masks, ion_type_masks=ion_type_masks, use_view_experts=use_view_experts) # [B, L, d_model]
+        out, guide_loss, LB_loss = self.flattenIntraCycleLayer(cycle_curve_data, DKP_embeddings, total_masks, ion_type_masks=ion_type_masks, use_view_experts=use_view_experts, gate_bias=gate_bias) # [B, L, d_model]
         total_guide_loss += guide_loss
         total_LB_loss += LB_loss
         total_aug_count += 1
         logits_index += 1
 
         for i, intra_MoELayer in enumerate(self.intra_MoE_layers):
-            out, guide_loss, LB_loss = intra_MoELayer(out, DKP_embeddings, total_masks, ion_type_masks=ion_type_masks, use_view_experts=use_view_experts) # [B, L, d_model]
+            out, guide_loss, LB_loss = intra_MoELayer(out, DKP_embeddings, total_masks, ion_type_masks=ion_type_masks, use_view_experts=use_view_experts, gate_bias=gate_bias) # [B, L, d_model]
             total_guide_loss += guide_loss
             total_LB_loss += LB_loss
             total_aug_count += 1
@@ -621,7 +693,7 @@ class Model(nn.Module):
         attn_mask = attn_mask.unsqueeze(1) # [B, 1, L, L]
         attn_mask = attn_mask==0 # set True to mask
         for i, inter_MoELayer in enumerate(self.inter_MoE_layers):
-            out, guide_loss, LB_loss = inter_MoELayer(out, DKP_embeddings, total_masks, attn_mask=attn_mask, ion_type_masks=ion_type_masks, use_view_experts=use_view_experts) # [B, L, d_model]
+            out, guide_loss, LB_loss = inter_MoELayer(out, DKP_embeddings, total_masks, attn_mask=attn_mask, ion_type_masks=ion_type_masks, use_view_experts=use_view_experts, gate_bias=gate_bias) # [B, L, d_model]
             total_guide_loss += guide_loss
             total_LB_loss += LB_loss
             total_aug_count += 1
